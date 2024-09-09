@@ -2,6 +2,7 @@
 
 use bevy::log::once;
 use bevy::prelude::*;
+// use bevy::log::FileAppenderSettings;
 
 fn main() {
     App::new()
@@ -9,6 +10,8 @@ fn main() {
             // Uncomment this to override the default log settings:
             // level: bevy::log::Level::TRACE,
             // filter: "wgpu=warn,bevy_ecs=info".to_string(),
+            // This will let you configure file logging
+            // file_appender_settings: Some(FileAppenderSettings::default()),
             ..default()
         }))
         .add_systems(Startup, setup)
