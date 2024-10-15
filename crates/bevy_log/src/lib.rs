@@ -53,12 +53,12 @@ pub use bevy_utils::{
 pub use tracing_subscriber;
 
 use bevy_app::{App, Plugin};
+#[cfg(feature = "tracing-chrome")]
+use bevy_utils::synccell::SyncCell;
 use tracing_log::LogTracer;
 #[cfg(feature = "tracing-chrome")]
 use tracing_subscriber::fmt::{format::DefaultFields, FormattedFields};
 use tracing_subscriber::{prelude::*, registry::Registry, EnvFilter, Layer};
-#[cfg(feature = "tracing-chrome")]
-use {bevy_ecs::system::Resource, bevy_utils::synccell::SyncCell};
 
 /// Wrapper resource for `tracing-chrome`'s flush guard.
 /// When the guard is dropped the chrome log is written to file.
@@ -279,12 +279,12 @@ impl Plugin for LogPlugin {
                             }
                         }))
                         .build();
-                    app.world.insert_non_send_resource(guard);
+                    app.world_mut().insert_non_send_resource(guard);
                     chrome_layer
                 };
 
                 #[cfg(feature = "tracing-tracy")]
-                let tracy_layer = tracing_tracy::TracyLayer::new();
+                let tracy_layer = tracing_tracy::TracyLayer::default();
 
                 let fmt_layer =
                     tracing_subscriber::fmt::Layer::default().with_writer(std::io::stderr);
