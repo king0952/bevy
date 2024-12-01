@@ -30,6 +30,8 @@ fn main() {
             level: Level::TRACE,
             filter: "warn,log_layers_ecs=trace".to_string(),
             custom_layer,
+            // file_appender_settings: Some(FileAppenderSettings::default()),
+            file_appender_settings: None,
         }))
         .add_systems(Startup, (log_system, setup))
         .add_systems(Update, print_logs)

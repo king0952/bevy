@@ -19,6 +19,7 @@
 extern crate alloc;
 
 use core::error::Error;
+use std::path::PathBuf;
 
 #[cfg(target_os = "android")]
 mod android_tracing;
@@ -51,19 +52,19 @@ pub use bevy_utils::{
 };
 pub use tracing_subscriber;
 
+use bevy_ecs::system::Resource;
+#[cfg(feature = "tracing-chrome")]
+use bevy_utils::synccell::SyncCell;
+
 use bevy_app::{App, Plugin};
 use tracing_log::LogTracer;
+#[cfg(feature = "tracing-chrome")]
+use tracing_subscriber::fmt::{format::DefaultFields, FormattedFields};
 use tracing_subscriber::{
     filter::{FromEnvError, ParseError},
     prelude::*,
     registry::Registry,
     EnvFilter, Layer,
-};
-#[cfg(feature = "tracing-chrome")]
-use {
-    bevy_ecs::system::Resource,
-    bevy_utils::synccell::SyncCell,
-    tracing_subscriber::fmt::{format::DefaultFields, FormattedFields},
 };
 
 /// Wrapper resource for `tracing-chrome`'s flush guard.
@@ -96,6 +97,7 @@ pub(crate) struct FlushGuard(SyncCell<tracing_chrome::FlushGuard>);
 ///             level: Level::DEBUG,
 ///             filter: "wgpu=error,bevy_render=info,bevy_ecs=trace".to_string(),
 ///             custom_layer: |_| None,
+///             file_appender_settings: None,
 ///         }))
 ///         .run();
 /// }
@@ -173,6 +175,14 @@ pub struct LogPlugin {
     ///
     /// Please see the `examples/log_layers.rs` for a complete example.
     pub custom_layer: fn(app: &mut App) -> Option<BoxedLayer>,
+
+    /// Configure file logging
+    ///
+    /// ## Platform-specific
+    ///
+    /// **`WASM`** does not support logging to a file.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub file_appender_settings: Option<FileAppenderSettings>,
 }
 
 /// A boxed [`Layer`] that can be used with [`LogPlugin`].
@@ -187,6 +197,69 @@ impl Default for LogPlugin {
             filter: DEFAULT_FILTER.to_string(),
             level: Level::INFO,
             custom_layer: |_| None,
+            file_appender_settings: None,
+        }
+    }
+}
+
+/// Enum to control how often a new log file will be created
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rolling {
+    /// Creates a new file every minute and appends the date to the file name
+    /// Date format: YYYY-MM-DD-HH-mm
+    Minutely,
+    /// Creates a new file every hour and appends the date to the file name
+    /// Date format: YYYY-MM-DD-HH
+    Hourly,
+    /// Creates a new file every day and appends the date to the file name
+    /// Date format: YYYY-MM-DD
+    Daily,
+    /// Never creates a new file
+    Never,
+}
+
+impl From<Rolling> for tracing_appender::rolling::Rotation {
+    fn from(val: Rolling) -> Self {
+        match val {
+            Rolling::Minutely => tracing_appender::rolling::Rotation::MINUTELY,
+            Rolling::Hourly => tracing_appender::rolling::Rotation::HOURLY,
+            Rolling::Daily => tracing_appender::rolling::Rotation::DAILY,
+            Rolling::Never => tracing_appender::rolling::Rotation::NEVER,
+        }
+    }
+}
+
+#[derive(Resource)]
+struct FileAppenderWorkerGuard(tracing_appender::non_blocking::WorkerGuard);
+
+/// Settings to control how to log to a file
+#[derive(Debug, Clone)]
+pub struct FileAppenderSettings {
+    /// Controls how often a new file will be created
+    ///
+    /// Defaults to [`Rolling::Never`]
+    pub rolling: Rolling,
+    /// The path of the directory where the log files will be added
+    ///
+    /// Defaults to the local directory
+    pub path: PathBuf,
+    /// The prefix added when creating a file
+    ///
+    /// Defaults to "log"
+    pub prefix: String,
+    /// When this is enabled, a panic hook will be used and any panic will be logged as an error
+    ///
+    /// Defaults to true
+    pub use_panic_hook: bool,
+}
+
+impl Default for FileAppenderSettings {
+    fn default() -> Self {
+        Self {
+            rolling: Rolling::Never,
+            path: PathBuf::from("."),
+            prefix: String::from("log"),
+            use_panic_hook: true,
         }
     }
 }
@@ -253,7 +326,7 @@ impl Plugin for LogPlugin {
                         }
                     }))
                     .build();
-                app.insert_resource(FlushGuard(SyncCell::new(guard)));
+                app.world_mut().insert_non_send_resource(guard);
                 chrome_layer
             };
 
@@ -273,12 +346,48 @@ impl Plugin for LogPlugin {
                     meta.fields().field("tracy.frame_mark").is_none()
                 }));
 
-            let subscriber = subscriber.with(fmt_layer);
-
             #[cfg(feature = "tracing-chrome")]
             let subscriber = subscriber.with(chrome_layer);
             #[cfg(feature = "tracing-tracy")]
             let subscriber = subscriber.with(tracy_layer);
+
+            let subscriber = subscriber.with(fmt_layer);
+
+            let file_appender_layer = self.file_appender_settings.as_ref().map(|settings| {
+                if settings.use_panic_hook {
+                    let old_handler = std::panic::take_hook();
+                    std::panic::set_hook(Box::new(move |panic_info| {
+                        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+                            error!("panic occurred: {s:?}");
+                        } else {
+                            error!("panic occurred");
+                        }
+                        old_handler(panic_info);
+                    }));
+                }
+
+                if settings.rolling == Rolling::Never && settings.prefix.is_empty() {
+                    panic!("Using the Rolling::Never variant with no prefix will result in an empty filename, which is invalid");
+                }
+                let file_appender = tracing_appender::rolling::RollingFileAppender::new(
+                    settings.rolling.into(),
+                    &settings.path,
+                    &settings.prefix,
+                );
+
+                let (non_blocking, worker_guard) = tracing_appender::non_blocking(file_appender);
+                // WARN We need to keep this somewhere so it doesn't get dropped.
+                // If it gets dropped then it will silently stop writing to the file
+                app.insert_resource(FileAppenderWorkerGuard(worker_guard));
+
+                // InnoCustomed: log to file as JSON-format
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_writer(non_blocking)
+            });
+            let subscriber = subscriber.with(file_appender_layer);
+
             finished_subscriber = subscriber;
         }
 
